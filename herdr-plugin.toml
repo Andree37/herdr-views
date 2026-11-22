@@ -55,3 +55,21 @@ command = ["sh", "open.sh", "prs"]
 id = "open-refs"
 title = "Links this agent mentioned"
 command = ["sh", "open.sh", "refs"]
+
+# Travel keys. The startup loop records every pane you focus, so these can
+# retrace them across tabs and spaces.
+
+[[actions]]
+id = "back"
+title = "Back to the previous pane"
+command = ["./hv", "back"]
+
+[[actions]]
+id = "forward"
+title = "Forward again"
+command = ["./hv", "forward"]
+
+[[actions]]
+id = "needs-you"
+title = "Go to the agent that needs you most"
+command = ["./hv", "needs-you"]

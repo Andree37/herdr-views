@@ -7,6 +7,11 @@ Also, as a background refresher started by the plugin's startup hook:
 
     hv _annotate_loop
 
+And for the travel keys, which plugin actions call:
+
+    hv back | forward    step through the panes you have focused, like a browser
+    hv needs-you         go to the agent at the top of the "needs you" queue
+
 Stdlib only, and Python 3.7 compatible, so it runs on whatever python3 is
 already on the machine.
 
@@ -19,6 +24,8 @@ Three things it does that herdr cannot do by itself:
              fakes it with a fixed set of rows.
 3. queue   - filters herdr's Agents panel down to agents that are blocked or
              done, which is the set that wants a human.
+4. history - remembers the panes you focus, so back and forward can retrace
+             them across tabs and spaces. Herdr keeps no such history.
 """
 
 import glob
@@ -28,6 +35,7 @@ import re
 import shlex
 import shutil
 import socket
+import threading
 import subprocess
 import sys
 import tempfile
@@ -533,7 +541,8 @@ def annotate_loop():
     exit immediately, so this watches for the server's socket disappearing and
     stops rather than outliving the server that started it.
     """
-    path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(HOME, ".config", "herdr", "herdr.sock")
+    path = socket_path()
+    threading.Thread(target=focus_loop, daemon=True).start()
     try:
         set_agent_view()
     except (RuntimeError, OSError, ValueError) as e:
@@ -553,6 +562,131 @@ def annotate_loop():
         time.sleep(STATUS_EVERY)
         if not os.path.exists(path):
             return
+
+
+# ---- travel: focus history (back / forward) and the top of the queue
+
+HISTORY = os.path.join(CACHE, "focus.json")
+HISTORY_MAX = 100
+JUMP_TTL = 3.0  # seconds a back/forward jump waits for herdr to confirm it
+
+
+def socket_path():
+    return os.environ.get("HERDR_SOCKET_PATH") or os.path.join(HOME, ".config", "herdr", "herdr.sock")
+
+
+def history():
+    h = load(HISTORY, {})
+    h.setdefault("panes", [])
+    h.setdefault("at", len(h["panes"]) - 1)
+    return h
+
+
+def pending_jump(h):
+    j = h.get("jump")
+    return j if j and time.time() - j.get("t", 0) < JUMP_TTL else None
+
+
+def record_focus(pane_id):
+    """Called for every focus change. A change we caused by back/forward moves
+    the cursor; any other one drops the forward part and appends, like a browser."""
+    if not pane_id:
+        return
+    h = history()
+    panes, at = h["panes"], h["at"]
+    j = pending_jump(h)
+    if j and j["pane"] == pane_id:
+        h["at"] = j["at"]
+    elif 0 <= at < len(panes) and panes[at] == pane_id:
+        pass
+    else:
+        panes = panes[:at + 1] + [pane_id]
+        if len(panes) > HISTORY_MAX:
+            panes = panes[-HISTORY_MAX:]
+        h["panes"], h["at"] = panes, len(panes) - 1
+    h.pop("jump", None)
+    save(HISTORY, h)
+
+
+def focused_pane():
+    for p in herdr("pane", "list")["panes"]:
+        if p.get("focused"):
+            return p["pane_id"]
+    return None
+
+
+def focus_loop():
+    """Follows herdr's focus events into the history. Tab and space switches
+    move focus without a pane event, so those look up the focused pane."""
+    kinds = ["pane.focused", "tab.focused", "workspace.focused"]
+    while os.path.exists(socket_path()):
+        try:
+            record_focus(focused_pane())
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(socket_path())
+            sock.sendall((json.dumps({"id": "hv-focus", "method": "events.subscribe",
+                                      "params": {"subscriptions": [{"type": k} for k in kinds]}}) + "\n").encode("utf-8"))
+            buf = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    msg = json.loads(line.decode("utf-8"))
+                    data = msg.get("data") or {}
+                    if data.get("type") == "pane_focused":
+                        record_focus(data.get("pane_id"))
+                    elif msg.get("event") in ("tab_focused", "workspace_focused") or \
+                            data.get("type") in ("tab_focused", "workspace_focused"):
+                        record_focus(focused_pane())
+            sock.close()
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            sys.stderr.write("focus: {}: {}\n".format(type(e).__name__, e))
+            sys.stderr.flush()
+        time.sleep(1)
+
+
+def go(pane_id, agent=False):
+    """Focuses a pane wherever it is, switching tab and space as needed."""
+    if agent:
+        herdr("agent", "focus", pane_id)
+    else:
+        socket_request("pane.focus", {"pane_id": pane_id})
+
+
+def step(direction):
+    """back (-1) or forward (+1) through the history, skipping closed panes."""
+    h = history()
+    panes = h["panes"]
+    j = pending_jump(h)
+    at = j["at"] if j else h["at"]
+    live = {p["pane_id"] for p in herdr("pane", "list")["panes"]}
+    here = focused_pane()
+    i = at + direction
+    while 0 <= i < len(panes) and (panes[i] not in live or panes[i] == here):
+        i += direction
+    if not 0 <= i < len(panes):
+        return "no further " + ("back" if direction < 0 else "forward")
+    h["jump"] = {"pane": panes[i], "at": i, "t": time.time()}
+    save(HISTORY, h)
+    go(panes[i])
+    return "→ " + panes[i]
+
+
+def needs_you():
+    """The top of the "needs you" queue: blocked agents first (they are asking
+    something), then done ones, newest change first. Pressing it again while
+    on that agent moves to the next one."""
+    agents = [a for a in herdr("agent", "list")["agents"]
+              if a.get("agent_status") in ("blocked", "done")]
+    if not agents:
+        return "no agent needs you"
+    agents.sort(key=lambda a: (a.get("agent_status") != "blocked", -(a.get("state_change_seq") or 0)))
+    pick = next((a for a in agents if not a.get("focused")), agents[0])
+    go(pick["pane_id"], agent=True)
+    return "→ " + pick["pane_id"]
 
 
 def main():
@@ -580,6 +714,12 @@ def main():
         print("annotated")
     elif cmd == "_annotate_loop":
         annotate_loop()
+    elif cmd in ("back", "forward", "needs-you"):
+        try:
+            msg = needs_you() if cmd == "needs-you" else step(-1 if cmd == "back" else 1)
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            msg = "{}: {}".format(type(e).__name__, e)
+        print(msg)
     elif cmd in MODES:
         main_ui(cmd)
     else:
