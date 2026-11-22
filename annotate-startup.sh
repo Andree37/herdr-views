@@ -12,7 +12,10 @@ PIDFILE="$STATE/annotate.pid"
 
 mkdir -p "$STATE"
 
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+# Only a pid that is still our loop counts: after a reboot macOS may have
+# handed the old pid to some other process.
+pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+if [ -n "$pid" ] && ps -o command= -p "$pid" 2>/dev/null | grep -q "hv _annotate_loop"; then
     exit 0
 fi
 

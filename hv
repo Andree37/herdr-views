@@ -29,6 +29,8 @@ Three things it does that herdr cannot do by itself:
              them across tabs and spaces. Herdr keeps no such history.
 """
 
+import contextlib
+import fcntl
 import glob
 import json
 import os
@@ -103,13 +105,38 @@ def load(path, default):
 
 
 def save(path, value):
+    """Writes atomically through a temp file of its own, so two processes
+    saving the same file never truncate each other's temp or leave it half-written."""
     try:
         os.makedirs(os.path.dirname(path))
     except OSError:
         pass
-    with open(path + ".tmp", "w") as f:
-        json.dump(value, f)
-    os.replace(path + ".tmp", path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(value, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@contextlib.contextmanager
+def locked(path):
+    """Holds an exclusive lock on path's .lock file for a read-modify-write."""
+    try:
+        os.makedirs(os.path.dirname(path))
+    except OSError:
+        pass
+    with open(path + ".lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def config():
@@ -543,7 +570,15 @@ def tree_ui():
             colors[name] = curses.color_pair(i) | (curses.A_DIM if c == -1 else 0)
         scr.timeout(TREE_REFRESH_MS)
         sel_id, top, msg = origin, 0, ""
-        roots = tree_nodes()
+
+        def refresh(old):
+            # a herdr hiccup keeps the last tree on screen instead of closing the popup
+            try:
+                return tree_nodes(), ""
+            except (RuntimeError, OSError, ValueError, KeyError) as e:
+                return old, "refresh failed: " + str(e)[:50]
+
+        roots, msg = refresh([])
         for anc in tree_path(roots, origin):  # start on the origin, or the fold that hides it
             if anc["id"] in folded:
                 sel_id = anc["id"]
@@ -583,12 +618,27 @@ def tree_ui():
             k = scr.getch()
             msg = ""
             if k == -1:
-                roots = tree_nodes()
+                roots, msg = refresh(roots)
+                continue
+            # a paste arrives as a burst; with a line break in it, it is text,
+            # not keys, so none of it moves, folds or jumps
+            scr.nodelay(True)
+            burst = []
+            while True:
+                x = scr.getch()
+                if x == -1:
+                    break
+                burst.append(x)
+            scr.timeout(TREE_REFRESH_MS)
+            if burst and any(c in (10, 13) for c in [k] + burst):
+                msg = "paste ignored"
+                continue
+            if k in (ord("q"), 27):
+                return
+            if not rows:
                 continue
             cur = rows[sel]
             n = cur["node"]
-            if k in (ord("q"), 27):
-                return
             if k in (ord("j"), curses.KEY_DOWN):
                 sel_id = ids[min(sel + 1, len(ids) - 1)]
             elif k in (ord("k"), curses.KEY_UP):
@@ -608,7 +658,7 @@ def tree_ui():
                 if n["children"]:
                     folded.symmetric_difference_update({n["id"]})
             elif k == ord("r"):
-                roots = tree_nodes()
+                roots, msg = refresh(roots)
             elif k in (10, 13, curses.KEY_ENTER):
                 try:
                     if n["kind"] == "agent":
@@ -783,20 +833,21 @@ def record_focus(pane_id):
     the cursor; any other one drops the forward part and appends, like a browser."""
     if not pane_id:
         return
-    h = history()
-    panes, at = h["panes"], h["at"]
-    j = pending_jump(h)
-    if j and j["pane"] == pane_id:
-        h["at"] = j["at"]
-    elif 0 <= at < len(panes) and panes[at] == pane_id:
-        pass
-    else:
-        panes = panes[:at + 1] + [pane_id]
-        if len(panes) > HISTORY_MAX:
-            panes = panes[-HISTORY_MAX:]
-        h["panes"], h["at"] = panes, len(panes) - 1
-    h.pop("jump", None)
-    save(HISTORY, h)
+    with locked(HISTORY):  # back/forward writes the same file
+        h = history()
+        panes, at = h["panes"], h["at"]
+        j = pending_jump(h)
+        if j and j["pane"] == pane_id:
+            h["at"] = j["at"]
+        elif 0 <= at < len(panes) and panes[at] == pane_id:
+            pass
+        else:
+            panes = panes[:at + 1] + [pane_id]
+            if len(panes) > HISTORY_MAX:
+                panes = panes[-HISTORY_MAX:]
+            h["panes"], h["at"] = panes, len(panes) - 1
+        h.pop("jump", None)
+        save(HISTORY, h)
 
 
 def focused_pane():
@@ -849,19 +900,20 @@ def go(pane_id, agent=False):
 
 def step(direction):
     """back (-1) or forward (+1) through the history, skipping closed panes."""
-    h = history()
-    panes = h["panes"]
-    j = pending_jump(h)
-    at = j["at"] if j else h["at"]
     live = {p["pane_id"] for p in herdr("pane", "list")["panes"]}
     here = focused_pane()
-    i = at + direction
-    while 0 <= i < len(panes) and (panes[i] not in live or panes[i] == here):
-        i += direction
-    if not 0 <= i < len(panes):
-        return "no further " + ("back" if direction < 0 else "forward")
-    h["jump"] = {"pane": panes[i], "at": i, "t": time.time()}
-    save(HISTORY, h)
+    with locked(HISTORY):  # the focus loop writes the same file
+        h = history()
+        panes = h["panes"]
+        j = pending_jump(h)
+        at = j["at"] if j else h["at"]
+        i = at + direction
+        while 0 <= i < len(panes) and (panes[i] not in live or panes[i] == here):
+            i += direction
+        if not 0 <= i < len(panes):
+            return "no further " + ("back" if direction < 0 else "forward")
+        h["jump"] = {"pane": panes[i], "at": i, "t": time.time()}
+        save(HISTORY, h)
     go(panes[i])
     return "→ " + panes[i]
 
