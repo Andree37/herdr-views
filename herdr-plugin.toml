@@ -1,0 +1,57 @@
+id = "local.herdr-views"
+name = "Herdr Views"
+version = "1.0.0"
+min_herdr_version = "0.9.0"
+description = "fzf views over herdr agents, their GitHub PRs, and the links they mentioned"
+platforms = ["linux", "macos"]
+
+# Popups, because a picker is transient and a popup leaves the tiled layout
+# alone, so the pane you opened it from stays focused underneath and the refs
+# view can scope to it.
+
+[[panes]]
+id = "agents"
+title = "Agents"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["./hv", "agents"]
+
+[[panes]]
+id = "prs"
+title = "PRs"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["./hv", "prs"]
+
+[[panes]]
+id = "refs"
+title = "Links"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["./hv", "refs"]
+
+# Keeps the spaces tree and the attention queue current. One-shot: it starts
+# the refresher, which stops itself when the server's socket disappears.
+[[startup]]
+command = ["sh", "annotate-startup.sh"]
+
+# Keys can only target an action, not a pane, so each action asks herdr to open
+# the pane it wants.
+
+[[actions]]
+id = "open-agents"
+title = "Travel to an agent"
+command = ["sh", "open.sh", "agents"]
+
+[[actions]]
+id = "open-prs"
+title = "My pull requests"
+command = ["sh", "open.sh", "prs"]
+
+[[actions]]
+id = "open-refs"
+title = "Links this agent mentioned"
+command = ["sh", "open.sh", "refs"]

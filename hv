@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""hv: fzf views over herdr agents, their GitHub PRs, and the links they mentioned.
+
+    hv [agents|refs|prs]
+
+Also, as a background refresher started by the plugin's startup hook:
+
+    hv _annotate_loop
+
+Stdlib only, and Python 3.7 compatible, so it runs on whatever python3 is
+already on the machine.
+
+Three things it does that herdr cannot do by itself:
+
+1. agents  - an fzf switcher over every agent, with a live preview of its pane
+             so you can see what one is doing before travelling to it.
+2. spaces  - writes each space's agents into workspace metadata, so the
+             spaces panel reads as a tree. Herdr has no tree or fold API; this
+             fakes it with a fixed set of rows.
+3. queue   - filters herdr's Agents panel down to agents that are blocked or
+             done, which is the set that wants a human.
+"""
+
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or HOME + "/.cache", "herdr-views")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or HOME + "/.config", "herdr-views", "config.json")
+SELF = os.path.abspath(__file__)
+# A plugin pane inherits the herdr server's PATH, which lacks what an
+# interactive shell adds. fzf and gh are usually in one of these.
+os.environ["PATH"] = os.pathsep.join([
+    HOME + "/.local/bin", HOME + "/.fzf/bin", "/opt/homebrew/bin", "/usr/local/bin",
+    os.environ.get("PATH", "")])
+
+RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, DIM, BOLD = "31", "32", "33", "34", "35", "36", "2", "1"
+STATUS_COLOR = {"blocked": RED, "working": YELLOW, "done": GREEN, "idle": DIM, "unknown": DIM}
+STATUS_GLYPH = {"blocked": "!", "working": "◐", "done": "✓", "idle": "○", "unknown": "?"}
+SPACE_GLYPH = {"blocked": "●", "working": "◐", "done": "✓", "idle": "○", "unknown": "○"}
+
+MODES = {
+    "agents": "enter: travel to it · ctrl-r: its refs",
+    "prs": "enter: open in the browser",
+    "refs": "enter: open in the browser",
+}
+KEYS = "ctrl-a agents · ctrl-p PRs · ctrl-r refs · ctrl-o open · ctrl-y copy · ctrl-l reload"
+
+# Rows available per space in the sidebar template, plus one for the "+N more".
+SPACE_ROWS = 5
+ANNOTATE_SOURCE = "hv"
+TOKEN_TTL_MS = 3600000
+# Agent status changes in seconds, so the tree has to be rewritten often or it
+# shows "idle" beside an agent that is plainly working.
+STATUS_EVERY = 5
+# The PR list is comparatively expensive, so it runs on a slower beat.
+PR_EVERY = 120
+TOKEN_NAMES = ("hv_pr", "hv_pr_state")
+PR_TTL = 120
+
+
+# ---- plumbing
+
+def c(text, code):
+    return "\033[{}m{}\033[0m".format(code, text)
+
+
+def row(kind, ident, url, aux, display):
+    """One tab-delimited record per line. fzf shows field 5 and we act on the rest."""
+    fields = [kind, ident, url or "", aux or "", display]
+    print("\t".join(re.sub(r"[\t\r\n]+", " ", str(f)) for f in fields))
+
+
+def message(text, color=DIM, url=""):
+    row("msg", "", url, "", c(text, color))
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (IOError, OSError, ValueError):
+        return default
+
+
+def save(path, value):
+    try:
+        os.makedirs(os.path.dirname(path))
+    except OSError:
+        pass
+    with open(path + ".tmp", "w") as f:
+        json.dump(value, f)
+    os.replace(path + ".tmp", path)
+
+
+def config():
+    cfg = {"open_cmd": None, "pr_search": "--author=@me --state=open"}
+    cfg.update(load(CONFIG, {}))
+    return cfg
+
+
+def state():
+    return load(os.environ.get("HV_STATE", ""), {"mode": "agents"})
+
+
+def set_state(**changes):
+    st = state()
+    st.update(changes)
+    save(os.environ["HV_STATE"], st)
+    return st
+
+
+def herdr(*args):
+    r = subprocess.run(["herdr"] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip()[:300] or "herdr {} failed".format(" ".join(args)))
+    return json.loads(r.stdout)["result"] if r.stdout.strip() else {}
+
+
+def socket_request(method, params):
+    """One request over herdr's socket, for the few APIs the CLI does not wrap."""
+    path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(HOME, ".config", "herdr", "herdr.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    try:
+        sock.connect(path)
+        sock.sendall((json.dumps({"id": "hv", "method": method, "params": params}) + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("herdr closed the socket")
+            buf += chunk
+    finally:
+        sock.close()
+    reply = json.loads(buf.split(b"\n")[0].decode("utf-8"))
+    if "error" in reply:
+        raise RuntimeError(str(reply["error"])[:300])
+    return reply.get("result") or {}
+
+
+def plugin_context():
+    """What herdr injects when hv runs as a plugin pane; empty from a shell.
+
+    A popup is not a pane, so this is the only reliable way to learn which pane
+    the user opened hv from.
+    """
+    try:
+        return json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+    except ValueError:
+        return {}
+
+
+def agent_panes():
+    spaces = {w["workspace_id"]: w.get("label") or "?" for w in herdr("workspace", "list")["workspaces"]}
+    tabs = {t["tab_id"]: t.get("label") or "?" for t in herdr("tab", "list")["tabs"]}
+    out = []
+    for p in herdr("pane", "list")["panes"]:
+        p["where"] = "{} / {}".format(spaces.get(p["workspace_id"], "?"), tabs.get(p["tab_id"], "?"))
+        out.append(p)
+    return out
+
+
+def to_clipboard(text):
+    """OSC 52, so it reaches the machine running the terminal even over ssh."""
+    import base64
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    sys.stderr.write("\033]52;c;{}\a".format(payload))
+    sys.stderr.flush()
+    return "copied"
+
+
+def open_urls(urls):
+    cmd = config()["open_cmd"] or ("open" if sys.platform == "darwin" else "xdg-open")
+    if not shutil.which(cmd.split()[0]):
+        return to_clipboard("\n".join(urls)) + " (no " + cmd + " here)"
+    for url in urls:
+        subprocess.Popen(shlex.split(cmd) + [url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return "opened {}".format(len(urls))
+
+
+# ---- agents
+
+def list_agents():
+    """One row per agent pane. Shell panes are left out: they were noise."""
+    for p in agent_panes():
+        if not p.get("agent"):
+            continue
+        status = p.get("agent_status") or "unknown"
+        tokens = p.get("tokens") or {}
+        pr = tokens.get("hv_pr", "")
+        row("pane", p["pane_id"], "", p["tab_id"], "{} {} {} {} {}".format(
+            c(STATUS_GLYPH.get(status, " "), STATUS_COLOR.get(status, DIM)),
+            "{:<34}".format(p["where"][:34]),
+            c("{:<8}".format(status), STATUS_COLOR.get(status, DIM)),
+            "{:<22}".format((p.get("terminal_title_stripped") or "")[:22]),
+            c(pr, DIM)))
+
+
+# ---- refs: the links an agent session mentioned
+
+REF_PATTERNS = [
+    ("pr", re.compile(r"https://github\.com/([^/\s]+/[^/\s]+/pull/\d+)")),
+    ("issue", re.compile(r"https://github\.com/([^/\s]+/[^/\s]+/issues/\d+)")),
+    ("repo", re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\s|$|\))")),
+    ("link", re.compile(r"(https?://[^\s\"'\\<>)\]`]+)")),
+]
+REF_URL = {"pr": "https://github.com/", "issue": "https://github.com/",
+           "repo": "https://github.com/", "link": ""}
+REF_KINDS = [("pr", "PR"), ("issue", "issue"), ("repo", "repo"), ("link", "link")]
+# A big tool result is a file dump or a search, whose links were not really
+# "mentioned" by the session.
+MAX_RESULT_CHARS = 4000
+
+
+def transcript(session_id):
+    found = glob.glob(os.path.join(HOME, ".claude", "projects", "*", session_id + ".jsonl"))
+    return found[0] if found else None
+
+
+def spoken(entry):
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        yield content
+    for block in content if isinstance(content, list) else []:
+        if block.get("type") == "text":
+            yield block.get("text") or ""
+        elif block.get("type") == "tool_use":
+            yield json.dumps(block.get("input"))
+        elif block.get("type") == "tool_result":
+            text = json.dumps(block.get("content"))
+            if len(text) <= MAX_RESULT_CHARS:
+                yield text
+
+
+def session_refs(session_id):
+    path = transcript(session_id)
+    refs = {}
+    if not path:
+        return refs
+    with open(path, errors="replace") as f:
+        for line in f:
+            if "http" not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if entry.get("type") not in ("user", "assistant"):
+                continue
+            for text in spoken(entry):
+                for kind, pattern in REF_PATTERNS:
+                    for m in pattern.finditer(text):
+                        ident = m.group(1).rstrip(".,;:")
+                        key = (kind, ident)
+                        # First pattern to match a URL wins, so a PR is not
+                        # also counted as a bare link.
+                        if any(k[1] in ident and k[0] != kind for k in refs):
+                            continue
+                        ref = refs.setdefault(key, {"kind": kind, "id": ident, "count": 0, "last": ""})
+                        ref["count"] += 1
+                        ref["last"] = max(ref["last"], entry.get("timestamp") or "")
+    return refs
+
+
+def list_refs():
+    panes = agent_panes()
+    scope = state().get("refs_pane")
+    chosen = [p for p in panes if p["pane_id"] == scope and p.get("agent_session")]
+    if not chosen:
+        chosen = [p for p in panes if p.get("agent_session")]
+    several = len(chosen) > 1
+    merged = {}
+    for p in chosen:
+        for key, ref in session_refs(p["agent_session"]["value"]).items():
+            ref["where"] = p["where"]
+            if key not in merged or ref["last"] > merged[key]["last"]:
+                merged[key] = ref
+    message("Links from {}".format(
+        "every agent session" if several else chosen[0]["where"] if chosen else "no agent session"), BOLD)
+    for kind, label_text in REF_KINDS:
+        mine = sorted((r for r in merged.values() if r["kind"] == kind),
+                      key=lambda r: r["last"], reverse=True)
+        for ref in mine:
+            row(kind, ref["id"], REF_URL[kind] + ref["id"], "", "{} {} {}".format(
+                c("{:<6}".format(label_text), CYAN), c("×{:<3}".format(ref["count"]), DIM), ref["id"][:90]))
+
+
+# ---- PRs
+
+def fetch_prs():
+    """My open PRs, via the gh CLI."""
+    if not shutil.which("gh"):
+        raise RuntimeError("gh is not installed; see https://cli.github.com")
+    args = ["gh", "search", "prs"] + shlex.split(config()["pr_search"]) + [
+        "--limit", "40", "--json", "number,title,url,repository,isDraft"]
+    r = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip()[:200] or "gh search prs failed")
+    return json.loads(r.stdout or "[]")
+
+
+def prs(force=False):
+    path = os.path.join(CACHE, "prs.json")
+    cached = load(path, None)
+    if cached and not force and time.time() - cached.get("at", 0) < PR_TTL:
+        return cached["value"], None
+    try:
+        value = fetch_prs()
+    except (RuntimeError, OSError, ValueError) as e:
+        return (cached or {}).get("value") or [], "{}".format(e)
+    save(path, {"at": time.time(), "value": value})
+    return value, None
+
+
+def list_prs(force):
+    found, error = prs(force)
+    if error:
+        message(error, RED)
+    for pr in found:
+        repo = (pr.get("repository") or {}).get("nameWithOwner") or ""
+        kind = "draft" if pr.get("isDraft") else "open"
+        row("pr", str(pr.get("number")), pr.get("url") or "", "", "{} {} {}".format(
+            c("{:<7}".format(kind), YELLOW if kind == "open" else DIM),
+            c("{:<28}".format(repo[:28]), DIM), (pr.get("title") or "")[:90]))
+
+
+# ---- acting on rows
+
+def fzf_arg(text):
+    for a, b in (("(", ")"), ("[", "]"), ("{", "}")):
+        if a not in text and b not in text:
+            return a + text + b
+    return "(" + re.sub(r"[()]", " ", text) + ")"
+
+
+def label(text):
+    return "change-border-label" + fzf_arg(" {} ".format(text.replace("\n", " ")[:150]))
+
+
+def switch(mode, **changes):
+    set_state(mode=mode, **changes)
+    return "reload({} _list)+change-prompt({}> )+change-header{}+clear-query+{}".format(
+        SELF, mode, fzf_arg("{}\n{}".format(MODES[mode], KEYS)), label(mode))
+
+
+def act(key, rows):
+    st = state()
+    if key == "esc":
+        return "abort"
+    if key == "reload":
+        return "reload({} _list force)".format(SELF)
+    rows = [r for r in rows if len(r) >= 4]
+    if not rows:
+        return ""
+    kind, ident, url = rows[0][0], rows[0][1], rows[0][2]
+    if key == "refs":
+        return switch("refs", refs_pane=ident if kind == "pane" else st.get("origin"))
+    if key == "open":
+        urls = [r[2] for r in rows if r[2]]
+        return label(open_urls(urls)) if urls else label("nothing to open")
+    if key == "copy":
+        text = "\n".join(r[1] if r[0] == "pane" else (r[2] or r[1]) for r in rows)
+        to_clipboard(text)
+        return label("copied " + text[:80])
+    if kind == "pane":
+        herdr("workspace", "focus", ident.split(":")[0])
+        herdr("tab", "focus", rows[0][3])
+        if any(p["pane_id"] == ident and p.get("agent") for p in herdr("pane", "list")["panes"]):
+            herdr("agent", "focus", ident)
+        return "abort"
+    return label(open_urls([url])) if url else ""
+
+
+def preview(kind, ident, url, aux):
+    if kind == "pane":
+        r = subprocess.run(["herdr", "pane", "read", ident, "--source", "recent", "--format", "ansi"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, universal_newlines=True)
+        lines = r.stdout.rstrip().split("\n")
+        print("\n".join(lines[-int(os.environ.get("FZF_PREVIEW_LINES", "40")):]))
+        return
+    if url:
+        print(c(url, BLUE))
+    if kind == "pr" and shutil.which("gh"):
+        r = subprocess.run(["gh", "pr", "view", url, "--comments"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+        print(r.stdout[:4000])
+
+
+def do_list(force):
+    mode = state()["mode"]
+    try:
+        if mode == "agents":
+            list_agents()
+        elif mode == "prs":
+            list_prs(force)
+        else:
+            list_refs()
+    except (RuntimeError, OSError, ValueError, KeyError) as e:
+        message("{}: {}".format(type(e).__name__, str(e)[:300]), RED)
+
+
+def main_ui(mode):
+    if not shutil.which("fzf"):
+        sys.exit("hv needs fzf: https://github.com/junegunn/fzf")
+    fd, path = tempfile.mkstemp(prefix="hv-state-")
+    os.close(fd)
+    os.environ["HV_STATE"] = path
+    try:
+        focused = plugin_context().get("focused_pane_id")
+        if not focused:
+            focused = next((p["pane_id"] for p in herdr("pane", "list")["panes"] if p.get("focused")), None)
+    except (RuntimeError, OSError, ValueError) as e:
+        sys.exit("hv needs a running herdr: {}".format(e))
+    set_state(mode=mode, origin=focused, refs_pane=focused)
+    hv = shlex.quote(SELF)
+    binds = ["enter:transform({} _act enter {{+f}})".format(hv), "esc:transform({} _act esc)".format(hv),
+             "ctrl-o:transform({} _act open {{+f}})".format(hv), "ctrl-y:transform({} _act copy {{+f}})".format(hv),
+             "ctrl-l:transform({} _act reload)".format(hv), "ctrl-r:transform({} _act refs {{+f}})".format(hv)]
+    binds += ["{}:transform({} _switch {})".format(key, hv, m) for key, m in
+              (("ctrl-a", "agents"), ("ctrl-p", "prs"))]
+    try:
+        subprocess.run(["fzf", "--ansi", "--multi", "--delimiter", "\t", "--with-nth", "5",
+                        "--layout", "reverse", "--border", "--border-label", " {} ".format(mode),
+                        # Without --no-hscroll fzf slides matched lines sideways to
+                        # reveal the match, which destroys the column alignment.
+                        "--no-hscroll", "--ellipsis", "…",
+                        "--prompt", mode + "> ", "--header", "{}\n{}".format(MODES[mode], KEYS),
+                        "--preview", "{} _preview {{1}} {{2}} {{3}} {{4}}".format(hv),
+                        "--preview-window", "right,45%,wrap,<70(down,45%,wrap)",
+                        "--bind", "start:reload({} _list)".format(hv),
+                        "--bind", ",".join(binds)], stdin=subprocess.DEVNULL)
+    finally:
+        os.unlink(path)
+
+
+# ---- the sidebar: a faked tree, and an attention queue
+
+def annotate_spaces(spaces):
+    """Writes each space's agents into workspace metadata as $hv_a1..$hv_aN.
+
+    Herdr has no tree or fold API for the sidebar, so the nesting is faked: the
+    space row template in config.toml has a fixed set of rows, and these tokens
+    fill them.
+    """
+    for ws in herdr("workspace", "list")["workspaces"]:
+        mine = sorted(spaces.get(ws["workspace_id"]) or [], key=lambda p: p["where"])
+        lines = []
+        for p in mine[:SPACE_ROWS]:
+            status = p.get("agent_status") or "unknown"
+            label_text = p["where"].split(" / ", 1)[-1][:18]
+            lines.append("  {} {:<19}{}".format(SPACE_GLYPH.get(status, "○"), label_text, status).rstrip())
+        if len(mine) > SPACE_ROWS:
+            lines.append("  +{} more".format(len(mine) - SPACE_ROWS))
+        args = ["workspace", "report-metadata", ws["workspace_id"], "--source", ANNOTATE_SOURCE,
+                "--ttl-ms", str(TOKEN_TTL_MS)]
+        for i in range(SPACE_ROWS + 1):
+            name = "hv_a{}".format(i + 1)
+            args += ["--token", "{}={}".format(name, lines[i])] if i < len(lines) else ["--clear-token", name]
+        try:
+            herdr(*args)
+        except (RuntimeError, OSError, ValueError):
+            continue
+
+
+def annotate_status():
+    """The tree, from live pane status only. Cheap enough to run every few seconds."""
+    spaces = {}
+    for p in agent_panes():
+        if p.get("agent"):
+            spaces.setdefault(p["workspace_id"], []).append(p)
+    annotate_spaces(spaces)
+
+
+def annotate_prs():
+    """Tags each agent pane with the PR for the repo it is working in."""
+    found, _ = prs()
+    by_repo = {}
+    for pr in found:
+        repo = (pr.get("repository") or {}).get("nameWithOwner") or ""
+        if repo:
+            by_repo.setdefault(repo.split("/")[-1], pr)
+    for p in agent_panes():
+        if not p.get("agent_session"):
+            continue
+        cwd = p.get("foreground_cwd") or p.get("cwd") or ""
+        pr = by_repo.get(os.path.basename(cwd.rstrip("/")))
+        args = ["pane", "report-metadata", p["pane_id"], "--source", ANNOTATE_SOURCE,
+                "--ttl-ms", str(TOKEN_TTL_MS)]
+        if pr:
+            args += ["--token", "hv_pr=#{}".format(pr.get("number")),
+                     "--token", "hv_pr_state={}".format("draft" if pr.get("isDraft") else "open")]
+        else:
+            for name in TOKEN_NAMES:
+                args += ["--clear-token", name]
+        try:
+            herdr(*args)
+        except (RuntimeError, OSError, ValueError):
+            continue
+
+
+def set_agent_view():
+    """Reduces herdr's Agents panel to agents that want a human.
+
+    Blocked means it is asking something; done means it finished and has not
+    been seen. Everything else stays visible in the spaces tree, so nothing is
+    lost by keeping this panel short.
+    """
+    return socket_request("agent.view.set", {
+        "source": "plugin:" + (os.environ.get("HERDR_PLUGIN_ID") or "local.herdr-views"),
+        "label": "needs you",
+        "filter": {"op": "in", "field": "status", "values": ["blocked", "done"]},
+        "sort": [{"field": "attention", "order": "desc"},
+                 {"field": "state_change_seq", "order": "desc"}],
+    })
+
+
+def annotate_loop():
+    """Two speeds: status often, PRs rarely.
+
+    Herdr asks plugins not to leave detached processes behind and startup hooks
+    exit immediately, so this watches for the server's socket disappearing and
+    stops rather than outliving the server that started it.
+    """
+    path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(HOME, ".config", "herdr", "herdr.sock")
+    try:
+        set_agent_view()
+    except (RuntimeError, OSError, ValueError) as e:
+        sys.stderr.write("view: {}\n".format(e))
+    last_prs = 0.0
+    while True:
+        steps = [("status", annotate_status)]
+        if time.time() - last_prs > PR_EVERY:
+            steps.append(("prs", annotate_prs))
+            last_prs = time.time()
+        for name, step in steps:
+            try:
+                step()
+            except (RuntimeError, OSError, ValueError, KeyError) as e:
+                sys.stderr.write("{}: {}: {}\n".format(name, type(e).__name__, e))
+                sys.stderr.flush()
+        time.sleep(STATUS_EVERY)
+        if not os.path.exists(path):
+            return
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "agents"
+    if cmd == "_list":
+        do_list(force=args[1:] == ["force"])
+    elif cmd == "_preview":
+        preview(*(args[1:5] + [""] * 4)[:4])
+    elif cmd == "_switch":
+        print(switch(args[1]))
+    elif cmd == "_act":
+        rows = []
+        if len(args) > 2:
+            with open(args[2]) as f:
+                rows = [line.rstrip("\n").split("\t") for line in f]
+        try:
+            print(act(args[1], rows))
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            print(label("{}: {}".format(type(e).__name__, e)))
+    elif cmd == "_annotate":
+        annotate_status()
+        annotate_prs()
+        set_agent_view()
+        print("annotated")
+    elif cmd == "_annotate_loop":
+        annotate_loop()
+    elif cmd in MODES:
+        main_ui(cmd)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
