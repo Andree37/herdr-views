@@ -9,6 +9,7 @@ Also, as a background refresher started by the plugin's startup hook:
 
 And for the travel keys, which plugin actions call:
 
+    hv tree              spaces > tabs > agents as a foldable tree; enter travels
     hv back | forward    step through the panes you have focused, like a browser
     hv needs-you         go to the agent at the top of the "needs you" queue
 
@@ -64,7 +65,8 @@ MODES = {
 KEYS = "ctrl-a agents · ctrl-p PRs · ctrl-r refs · ctrl-o open · ctrl-y copy · ctrl-l reload"
 
 # Rows available per space in the sidebar template, plus one for the "+N more".
-SPACE_ROWS = 5
+SPACE_ROWS = 6
+SIDEBAR_TEXT = 34  # sidebar_width 38, less the row's own padding
 ANNOTATE_SOURCE = "hv"
 TOKEN_TTL_MS = 3600000
 # Agent status changes in seconds, so the tree has to be rewritten often or it
@@ -453,6 +455,179 @@ def main_ui(mode):
         os.unlink(path)
 
 
+# ---- tree: spaces > tabs > agents, foldable, in a popup
+
+URGENCY = {"blocked": 4, "done": 3, "working": 2, "idle": 1, "unknown": 0}
+TREE_FOLDS = os.path.join(CACHE, "tree-folds.json")
+TREE_REFRESH_MS = 2000
+
+
+def tree_nodes():
+    """Spaces, their tabs and each tab's agents. A space with one tab skips the
+    tab level, so the tree only nests where there is something to tell apart."""
+    spaces = herdr("workspace", "list")["workspaces"]
+    tabs = herdr("tab", "list")["tabs"]
+    panes = herdr("pane", "list")["panes"]
+    roots = []
+    for ws in sorted(spaces, key=lambda w: w.get("number") or 0):
+        space = {"kind": "space", "id": ws["workspace_id"], "label": ws.get("label") or "?", "children": []}
+        mine = sorted([t for t in tabs if t["workspace_id"] == ws["workspace_id"]], key=lambda t: t.get("number") or 0)
+        for t in mine:
+            tab = {"kind": "tab", "id": t["tab_id"], "label": t.get("label") or str(t.get("number") or "?"),
+                   "children": []}
+            for p in panes:
+                if p["tab_id"] == t["tab_id"] and p.get("agent"):
+                    tab["children"].append({
+                        "kind": "agent", "id": p["pane_id"], "agent": p["agent"], "children": [],
+                        "status": p.get("agent_status") or "unknown",
+                        "label": p.get("terminal_title_stripped") or p["agent"]})
+            if len(mine) == 1:
+                space["children"].extend(tab["children"])
+            else:
+                space["children"].append(tab)
+        roots.append(space)
+    return roots
+
+
+def subtree_statuses(node):
+    if node["kind"] == "agent":
+        return [node["status"]]
+    out = []
+    for c in node["children"]:
+        out += subtree_statuses(c)
+    return out
+
+
+def tree_rows(roots, folded):
+    rows = []
+
+    def walk(node, depth, parent):
+        rows.append({"node": node, "depth": depth, "parent": parent})
+        if node["children"] and node["id"] not in folded:
+            for c in node["children"]:
+                walk(c, depth + 1, node)
+    for r in roots:
+        walk(r, 0, None)
+    return rows
+
+
+def tree_path(roots, target):
+    """The nodes from a root down to target, or [] when it is not in the tree."""
+    for r in roots:
+        if r["id"] == target:
+            return [r]
+        below = tree_path(r["children"], target)
+        if below:
+            return [r] + below
+    return []
+
+
+def tree_ui():
+    import curses
+    os.environ.setdefault("ESCDELAY", "25")
+    folded = set(load(TREE_FOLDS, []))
+    origin = plugin_context().get("focused_pane_id")
+    if not origin:
+        try:
+            origin = focused_pane()
+        except (RuntimeError, OSError, ValueError):
+            origin = None
+
+    def run(scr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        colors = {}
+        for i, (name, c) in enumerate((("blocked", curses.COLOR_RED), ("working", curses.COLOR_YELLOW),
+                                       ("done", curses.COLOR_GREEN), ("idle", -1), ("unknown", -1)), 1):
+            curses.init_pair(i, c, -1)
+            colors[name] = curses.color_pair(i) | (curses.A_DIM if c == -1 else 0)
+        scr.timeout(TREE_REFRESH_MS)
+        sel_id, top, msg = origin, 0, ""
+        roots = tree_nodes()
+        for anc in tree_path(roots, origin):  # start on the origin, or the fold that hides it
+            if anc["id"] in folded:
+                sel_id = anc["id"]
+                break
+        while True:
+            rows = tree_rows(roots, folded)
+            ids = [r["node"]["id"] for r in rows]
+            sel = ids.index(sel_id) if sel_id in ids else 0
+            h, w = scr.getmaxyx()
+            body = max(1, h - 2)
+            top = min(max(top, sel - body + 1), sel)
+            scr.erase()
+            scr.addnstr(0, 0, " spaces · j/k move · h/l fold · space toggle · enter go · q quit  " + msg,
+                        w - 1, curses.A_BOLD)
+            for y, r in enumerate(rows[top:top + body], 1):
+                n = r["node"]
+                statuses = subtree_statuses(n)
+                worst = max(statuses, key=lambda s: URGENCY.get(s, 0)) if statuses else "unknown"
+                arrow = " " if not n["children"] else ("▸" if n["id"] in folded else "▾")
+                indent = "  " * r["depth"]
+                attr = curses.A_REVERSE if top + y - 1 == sel else 0
+                glyph = STATUS_GLYPH.get(worst, " ") if statuses else " "
+                if n["kind"] == "agent":
+                    text = "{}{} {} {:<40} {}".format(indent, arrow, glyph, n["label"][:40], n["status"])
+                else:
+                    counts = ""
+                    if n["id"] in folded or n["kind"] == "space":
+                        tally = {}
+                        for st in statuses:
+                            tally[st] = tally.get(st, 0) + 1
+                        counts = "  " + " ".join("{}{}".format(STATUS_GLYPH[k], tally[k])
+                                                 for k in ("blocked", "done", "working", "idle") if k in tally)
+                    text = "{}{} {} {}{}".format(indent, arrow, glyph, n["label"], counts)
+                    attr |= curses.A_BOLD if n["kind"] == "space" else 0
+                scr.addnstr(y, 0, text.ljust(w - 1), w - 1, attr | colors.get(worst, 0))
+            scr.refresh()
+            k = scr.getch()
+            msg = ""
+            if k == -1:
+                roots = tree_nodes()
+                continue
+            cur = rows[sel]
+            n = cur["node"]
+            if k in (ord("q"), 27):
+                return
+            if k in (ord("j"), curses.KEY_DOWN):
+                sel_id = ids[min(sel + 1, len(ids) - 1)]
+            elif k in (ord("k"), curses.KEY_UP):
+                sel_id = ids[max(sel - 1, 0)]
+            elif k == ord("g"):
+                sel_id = ids[0]
+            elif k == ord("G"):
+                sel_id = ids[-1]
+            elif k in (ord("h"), curses.KEY_LEFT):
+                if n["children"] and n["id"] not in folded:
+                    folded.add(n["id"])
+                elif cur["parent"]:
+                    sel_id = cur["parent"]["id"]
+            elif k in (ord("l"), curses.KEY_RIGHT):
+                folded.discard(n["id"])
+            elif k == ord(" "):
+                if n["children"]:
+                    folded.symmetric_difference_update({n["id"]})
+            elif k == ord("r"):
+                roots = tree_nodes()
+            elif k in (10, 13, curses.KEY_ENTER):
+                try:
+                    if n["kind"] == "agent":
+                        herdr("agent", "focus", n["id"])
+                    elif n["kind"] == "tab":
+                        herdr("tab", "focus", n["id"])
+                    else:
+                        herdr("workspace", "focus", n["id"])
+                    return
+                except (RuntimeError, OSError, ValueError) as e:
+                    msg = str(e)[:60]
+            save(TREE_FOLDS, sorted(folded))
+
+    try:
+        curses.wrapper(run)
+    finally:
+        save(TREE_FOLDS, sorted(folded))
+
+
 # ---- the sidebar: a faked tree, and an attention queue
 
 def annotate_spaces(spaces):
@@ -464,16 +639,32 @@ def annotate_spaces(spaces):
     """
     for ws in herdr("workspace", "list")["workspaces"]:
         mine = sorted(spaces.get(ws["workspace_id"]) or [], key=lambda p: p["where"])
+        tabs = sorted({p["tab_id"] for p in mine})
+        items = []  # (depth, glyph, text); tabs become a level only when a space has several
+        for tab in tabs:
+            agents = [p for p in mine if p["tab_id"] == tab]
+            if len(tabs) > 1:
+                worst = max((p.get("agent_status") or "unknown" for p in agents), key=lambda s: URGENCY.get(s, 0))
+                items.append((0, SPACE_GLYPH.get(worst, "○"), "tab " + agents[0]["where"].split(" / ", 1)[-1]))
+            for p in agents:
+                title = p.get("terminal_title_stripped") or p.get("agent") or "agent"
+                items.append((1 if len(tabs) > 1 else 0,
+                              SPACE_GLYPH.get(p.get("agent_status") or "unknown", "○"), title))
         lines = []
-        for p in mine[:SPACE_ROWS]:
-            status = p.get("agent_status") or "unknown"
-            label_text = p["where"].split(" / ", 1)[-1][:18]
-            lines.append("  {} {:<19}{}".format(SPACE_GLYPH.get(status, "○"), label_text, status).rstrip())
-        if len(mine) > SPACE_ROWS:
-            lines.append("  +{} more".format(len(mine) - SPACE_ROWS))
+        for i, (depth, glyph, text) in enumerate(items[:SPACE_ROWS]):
+            last = i == len(items) - 1 or (i + 1 < len(items) and items[i + 1][0] < depth)
+            if depth == 0:
+                branch = "└─" if not any(d == 0 for d, _, _ in items[i + 1:]) else "├─"
+            else:
+                more_top = any(d == 0 for d, _, _ in items[i + 1:])
+                branch = ("│ " if more_top else "  ") + ("└─" if last else "├─")
+            line = "{} {} {}".format(branch, glyph, text)
+            lines.append(" " + line[:SIDEBAR_TEXT])
+        if len(items) > SPACE_ROWS:
+            lines[-1] = " └─ +{} more".format(len(items) - SPACE_ROWS + 1)
         args = ["workspace", "report-metadata", ws["workspace_id"], "--source", ANNOTATE_SOURCE,
                 "--ttl-ms", str(TOKEN_TTL_MS)]
-        for i in range(SPACE_ROWS + 1):
+        for i in range(SPACE_ROWS):
             name = "hv_a{}".format(i + 1)
             args += ["--token", "{}={}".format(name, lines[i])] if i < len(lines) else ["--clear-token", name]
         try:
@@ -714,6 +905,8 @@ def main():
         print("annotated")
     elif cmd == "_annotate_loop":
         annotate_loop()
+    elif cmd == "tree":
+        tree_ui()
     elif cmd in ("back", "forward", "needs-you"):
         try:
             msg = needs_you() if cmd == "needs-you" else step(-1 if cmd == "back" else 1)

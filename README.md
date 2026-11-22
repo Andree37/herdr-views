@@ -3,6 +3,9 @@
 A [herdr](https://herdr.dev) plugin with fzf views over your agents:
 
 - **Agents**: travel to any agent, with blocked and done ones first.
+- **Tree**: spaces > tabs > agents as a foldable tree. `j`/`k` move, `h`/`l` fold and unfold, `space`
+  toggles, `enter` travels to the agent, tab or space. A folded branch shows its most urgent status and
+  counts; folds are remembered.
 - **PRs**: your GitHub pull requests.
 - **Links**: the links the focused agent mentioned.
 
@@ -19,6 +22,6 @@ panes you focus for `back` and `forward` (in `~/.cache/herdr-views/focus.json`).
 herdr plugin install Andree37/herdr-views
 ```
 
-Bind the actions (`local.herdr-views.open-agents`, `open-prs`, `open-refs`, `back`, `forward`,
+Bind the actions (`local.herdr-views.open-agents`, `open-tree`, `open-prs`, `open-refs`, `back`, `forward`,
 `needs-you`) in
 `~/.config/herdr/config.toml` with `type = "plugin_action"`. Needs `fzf`, `jq` and `gh`.

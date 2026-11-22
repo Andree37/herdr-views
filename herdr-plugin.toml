@@ -33,6 +33,14 @@ width = "90%"
 height = "90%"
 command = ["./hv", "refs"]
 
+[[panes]]
+id = "tree"
+title = "Spaces"
+placement = "popup"
+width = "70%"
+height = "80%"
+command = ["./hv", "tree"]
+
 # Keeps the spaces tree and the attention queue current. One-shot: it starts
 # the refresher, which stops itself when the server's socket disappears.
 [[startup]]
@@ -45,6 +53,11 @@ command = ["sh", "annotate-startup.sh"]
 id = "open-agents"
 title = "Travel to an agent"
 command = ["sh", "open.sh", "agents"]
+
+[[actions]]
+id = "open-tree"
+title = "Spaces, tabs and agents as a tree"
+command = ["sh", "open.sh", "tree"]
 
 [[actions]]
 id = "open-prs"
