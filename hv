@@ -680,6 +680,9 @@ def tree_ui():
 
 # ---- the sidebar: a faked tree, and an attention queue
 
+BLANK = "\u2800"  # blank braille: herdr trims every kind of leading space
+
+
 def annotate_spaces(spaces):
     """Writes each space's agents into workspace metadata as $hv_a1..$hv_aN.
 
@@ -707,11 +710,12 @@ def annotate_spaces(spaces):
                 branch = "└─" if not any(d == 0 for d, _, _ in items[i + 1:]) else "├─"
             else:
                 more_top = any(d == 0 for d, _, _ in items[i + 1:])
-                branch = ("│ " if more_top else "  ") + ("└─" if last else "├─")
+                # Herdr trims leading spaces from a row, so indent with a blank that is not a space.
+                branch = ("│" + BLANK if more_top else BLANK * 2) + ("└─" if last else "├─")
             line = "{} {} {}".format(branch, glyph, text)
-            lines.append(" " + line[:SIDEBAR_TEXT])
+            lines.append(BLANK + line[:SIDEBAR_TEXT])
         if len(items) > SPACE_ROWS:
-            lines[-1] = " └─ +{} more".format(len(items) - SPACE_ROWS + 1)
+            lines[-1] = BLANK + "└─ +{} more".format(len(items) - SPACE_ROWS + 1)
         args = ["workspace", "report-metadata", ws["workspace_id"], "--source", ANNOTATE_SOURCE,
                 "--ttl-ms", str(TOKEN_TTL_MS)]
         for i in range(SPACE_ROWS):
