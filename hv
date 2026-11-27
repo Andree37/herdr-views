@@ -783,33 +783,7 @@ def annotate_status():
         card = cards.get(session_id(p))
         if card:
             p["hv_card"] = card_text(card)
-        annotate_card(p, card)
     annotate_spaces(spaces)
-
-
-CT_SOURCE = "hv-ct"  # its own source, so these tokens and the PR ones never replace each other
-CT_REFRESH = 600     # seconds; tokens live an hour, so an unchanged one is re-sent now and then
-_card_sent = {}
-
-
-def annotate_card(pane, card):
-    """Tags an agent pane with its code-tree card: $hv_ct is the card, and
-    $hv_ct_you is set only while points in its tree wait for you, which is what
-    puts the agent in the "needs you" panel even when herdr sees it as idle."""
-    you = card[2] if card else 0
-    value = (card[1] if card else "", "{} waiting for you".format(you) if you else "")
-    pane_id = pane["pane_id"]
-    last = _card_sent.get(pane_id)
-    if last and last[0] == value and time.time() - last[1] < CT_REFRESH:
-        return
-    args = ["pane", "report-metadata", pane_id, "--source", CT_SOURCE, "--ttl-ms", str(TOKEN_TTL_MS)]
-    for name, text in (("hv_ct", value[0]), ("hv_ct_you", value[1])):
-        args += ["--token", "{}={}".format(name, text)] if text else ["--clear-token", name]
-    try:
-        herdr(*args)
-        _card_sent[pane_id] = (value, time.time())
-    except (RuntimeError, OSError, ValueError):
-        pass
 
 
 def annotate_prs():
@@ -849,11 +823,7 @@ def set_agent_view():
     return socket_request("agent.view.set", {
         "source": "plugin:" + (os.environ.get("HERDR_PLUGIN_ID") or "local.herdr-views"),
         "label": "needs you",
-        # blocked or done in herdr's eyes, or a code-tree point waiting for you
-        "filter": {"op": "any", "filters": [
-            {"op": "in", "field": "status", "values": ["blocked", "done"]},
-            {"op": "exists", "field": {"token": "hv_ct_you"}},
-        ]},
+        "filter": {"op": "in", "field": "status", "values": ["blocked", "done"]},
         "sort": [{"field": "attention", "order": "desc"},
                  {"field": "state_change_seq", "order": "desc"}],
     })
@@ -1004,18 +974,13 @@ def step(direction):
 
 def needs_you():
     """The top of the "needs you" queue: blocked agents first (they are asking
-    something), then ones whose code-tree has a point waiting for you, then done
-    ones, newest change first. Pressing it again while
+    something), then done ones, newest change first. Pressing it again while
     on that agent moves to the next one."""
-    every = herdr("agent", "list")["agents"]
-    cards = ct_cards(sorted({session_id(a) for a in every if session_id(a)}))
-    asks = {session_id(a) for a in every if (cards.get(session_id(a)) or (0, 0, 0))[2] > 0}
-    agents = [a for a in every if a.get("agent_status") in ("blocked", "done") or session_id(a) in asks]
+    agents = [a for a in herdr("agent", "list")["agents"]
+              if a.get("agent_status") in ("blocked", "done")]
     if not agents:
         return "no agent needs you"
-    # blocked first, then a code-tree question waiting for you, then done
-    rank = lambda a: 0 if a.get("agent_status") == "blocked" else 1 if session_id(a) in asks else 2
-    agents.sort(key=lambda a: (rank(a), -(a.get("state_change_seq") or 0)))
+    agents.sort(key=lambda a: (a.get("agent_status") != "blocked", -(a.get("state_change_seq") or 0)))
     pick = next((a for a in agents if not a.get("focused")), agents[0])
     go(pick["pane_id"], agent=True)
     return "→ " + pick["pane_id"]
