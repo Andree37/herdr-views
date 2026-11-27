@@ -700,8 +700,7 @@ def annotate_spaces(spaces):
                 worst = max((p.get("agent_status") or "unknown" for p in agents), key=lambda s: URGENCY.get(s, 0))
                 items.append((0, SPACE_GLYPH.get(worst, "○"), "tab " + agents[0]["where"].split(" / ", 1)[-1]))
             for p in agents:
-                # the code-tree card Claude is on, when there is one, says more than the terminal title
-                title = p.get("hv_card") or p.get("terminal_title_stripped") or p.get("agent") or "agent"
+                title = p.get("terminal_title_stripped") or p.get("agent") or "agent"
                 items.append((1 if len(tabs) > 1 else 0,
                               SPACE_GLYPH.get(p.get("agent_status") or "unknown", "○"), title))
         lines = []
@@ -728,61 +727,12 @@ def annotate_spaces(spaces):
             continue
 
 
-def session_id(pane):
-    s = pane.get("agent_session")
-    return (s.get("value") if isinstance(s, dict) else s) or ""
-
-
-def ct_cards(sessions):
-    """What code-tree knows about each Claude session: the card it is on and how
-    many points of its package wait for you or are still open.
-
-    One `ct where` call for all of them; an empty map when ct is not installed,
-    so the sidebar just shows terminal titles as before.
-    """
-    ct = shutil.which("ct") or os.path.join(HOME, "go", "bin", "ct")
-    if not sessions or not os.access(ct, os.X_OK):
-        return {}
-    try:
-        r = subprocess.run([ct, "where"] + sessions, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    cards = {}
-    for line in r.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) == 5 and parts[2]:
-            try:
-                cards[parts[0]] = (parts[1], parts[2], int(parts[3]), int(parts[4]))
-            except ValueError:
-                continue
-    return cards
-
-
-def card_text(card):
-    """"!1 ?2 Drag feel": what waits for you first, so a narrow sidebar never cuts it."""
-    _, title, you, open_ = card
-    counts = []
-    if you:
-        counts.append("!{}".format(you))
-    if open_:
-        counts.append("?{}".format(open_))
-    return " ".join(counts + [title])
-
-
 def annotate_status():
     """The tree, from live pane status only. Cheap enough to run every few seconds."""
     spaces = {}
-    agents = []
     for p in agent_panes():
         if p.get("agent"):
             spaces.setdefault(p["workspace_id"], []).append(p)
-            agents.append(p)
-    cards = ct_cards(sorted({session_id(p) for p in agents if session_id(p)}))
-    for p in agents:
-        card = cards.get(session_id(p))
-        if card:
-            p["hv_card"] = card_text(card)
     annotate_spaces(spaces)
 
 
